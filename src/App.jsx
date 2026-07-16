@@ -1,0 +1,1900 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Square,
+  Brain,
+  CalendarCheck,
+  ClipboardCheck,
+  Download,
+  FileText,
+  Home,
+  MessageCircle,
+  Mic,
+  PauseCircle,
+  PlayCircle,
+  Plus,
+  Send,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  Smartphone,
+  Trash2,
+  Upload,
+  Wand2,
+  Wifi,
+  WifiOff,
+} from "lucide-react";
+
+const STORE_KEY = "edubrain_sman9_notulen_v4";
+const AUTH_KEY = "edubrain_sman9_admin_auth";
+
+const initialData = {
+  meetings: [],
+  documents: [],
+  chats: [],
+  activities: [],
+};
+
+const navItems = [
+  { id: "home", label: "Home", icon: Home },
+  { id: "meetings", label: "Rapat", icon: Mic },
+  { id: "activities", label: "Aktivitas", icon: Upload },
+  { id: "brain", label: "AI", icon: Brain },
+  { id: "settings", label: "Setelan", icon: Settings },
+];
+
+function getAuthToken() {
+  try {
+    const raw = localStorage.getItem(AUTH_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed?.token || "";
+  } catch {
+    return "";
+  }
+}
+
+function authHeaders(extra = {}) {
+  const token = getAuthToken();
+  return token
+    ? { ...extra, Authorization: `Bearer ${token}`, "x-edubrain-token": token }
+    : extra;
+}
+
+function uid() {
+  if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+  return String(Date.now()) + "-" + String(Math.random()).slice(2);
+}
+
+function loadData() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    return raw ? JSON.parse(raw) : initialData;
+  } catch {
+    return initialData;
+  }
+}
+
+function saveData(data) {
+  localStorage.setItem(STORE_KEY, JSON.stringify(data));
+}
+
+function cx(...parts) {
+  return parts.filter(Boolean).join(" ");
+}
+
+function cleanActivityMeta(meta) {
+  const raw = String(meta || "");
+
+  const dateMatch = raw.match(/\d{1,2}\/\d{1,2}\/\d{4}|\d{4}-\d{2}-\d{2}/);
+  const classMatch = raw.match(/\b(X|XI|XII|10|11|12)[\s-]*[A-Z0-9]+\b/i);
+
+  let kelas = classMatch ? classMatch[0].replace(/\s+/g, "").toUpperCase() : "Kegiatan";
+  let tanggal = dateMatch ? dateMatch[0] : "";
+
+  if (tanggal.includes("-")) {
+    try {
+      tanggal = new Date(tanggal).toLocaleDateString("id-ID");
+    } catch {
+      tanggal = "";
+    }
+  }
+
+  return tanggal ? `${kelas} - ${tanggal}` : kelas;
+}
+
+function readTextFile(file) {
+  return new Promise((resolve) => {
+    const allowed =
+      file.type.startsWith("text/") ||
+      file.name.endsWith(".txt") ||
+      file.name.endsWith(".csv") ||
+      file.name.endsWith(".md") ||
+      file.name.endsWith(".json");
+
+    if (!allowed) {
+      resolve("");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || "").slice(0, 12000));
+    reader.onerror = () => resolve("");
+    reader.readAsText(file);
+  });
+}
+
+function normalizeEduData(input) {
+  return {
+    meetings: Array.isArray(input?.meetings) ? input.meetings : [],
+    documents: Array.isArray(input?.documents) ? input.documents : [],
+    chats: Array.isArray(input?.chats) ? input.chats : [],
+    activities: Array.isArray(input?.activities) ? input.activities : [],
+  };
+}
+
+function hasAnyData(input) {
+  const data = normalizeEduData(input);
+  return data.meetings.length > 0 || data.documents.length > 0 || data.chats.length > 0 || data.activities.length > 0;
+}
+
+function resizeImageFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !file.type.startsWith("image/")) {
+      reject(new Error("File bukan gambar."));
+      return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      const img = new Image();
+
+      img.onload = () => {
+        const maxW = 1100;
+        const maxH = 760;
+        let w = img.width;
+        let h = img.height;
+
+        const ratio = Math.min(maxW / w, maxH / h, 1);
+        w = Math.round(w * ratio);
+        h = Math.round(h * ratio);
+
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.78);
+        resolve(dataUrl);
+      };
+
+      img.onerror = () => reject(new Error("Gambar tidak bisa dibaca."));
+      img.src = reader.result;
+    };
+
+    reader.onerror = () => reject(new Error("Gagal membaca gambar."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function useEduData() {
+  const [data, setDataBase] = useState(loadData);
+  const [dbStatus, setDbStatus] = useState({
+    ready: false,
+    message: "Mengecek database...",
+    updated_at: null,
+  });
+
+  const hydratedRef = useRef(false);
+  const saveTimerRef = useRef(null);
+  const lastSavedRef = useRef("");
+
+  function setData(next) {
+    setDataBase((prev) => {
+      const value = typeof next === "function" ? next(prev) : next;
+      return normalizeEduData(value);
+    });
+  }
+
+  async function saveToDb(snapshot = data, message = "Data tersinkron ke database") {
+    const cleanData = normalizeEduData(snapshot);
+
+    try {
+      const r = await fetch("/api/db/state", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ data: cleanData }),
+      });
+
+      const result = await r.json();
+
+      if (!result.ok) {
+        throw new Error(result.message || result.error || "Database belum menerima data.");
+      }
+
+      lastSavedRef.current = JSON.stringify(cleanData);
+
+      setDbStatus({
+        ready: true,
+        message,
+        updated_at: result?.data?.updated_at || new Date().toISOString(),
+      });
+
+      return true;
+    } catch (error) {
+      setDbStatus({
+        ready: false,
+        message: "Gagal simpan DB: " + error.message,
+        updated_at: null,
+      });
+
+      return false;
+    }
+  }
+
+  async function loadFromDb() {
+    setDbStatus((prev) => ({
+      ...prev,
+      message: "Memuat data dari database...",
+    }));
+
+    try {
+      const r = await fetch("/api/db/state", { cache: "no-store" });
+      const result = await r.json();
+
+      if (!result.ok || !result.data) {
+        throw new Error(result.message || result.error || "Data database belum tersedia.");
+      }
+
+      const remoteData = normalizeEduData(result.data);
+      const localData = normalizeEduData(loadData());
+
+      if (hasAnyData(remoteData)) {
+        setDataBase(remoteData);
+        saveData(remoteData);
+        lastSavedRef.current = JSON.stringify(remoteData);
+
+        setDbStatus({
+          ready: true,
+          message: "Data berhasil dimuat dari database",
+          updated_at: result.updated_at || null,
+        });
+
+        return remoteData;
+      }
+
+      if (hasAnyData(localData)) {
+        setDataBase(localData);
+        saveData(localData);
+        await saveToDb(localData, "Database kosong, data lokal dikirim ke database");
+        return localData;
+      }
+
+      setDataBase(initialData);
+      saveData(initialData);
+      lastSavedRef.current = JSON.stringify(initialData);
+
+      setDbStatus({
+        ready: true,
+        message: "Database aktif, tetapi data masih kosong",
+        updated_at: result.updated_at || null,
+      });
+
+      return initialData;
+    } catch (error) {
+      setDbStatus({
+        ready: false,
+        message: "Database belum tersinkron: " + error.message,
+        updated_at: null,
+      });
+
+      return data;
+    } finally {
+      hydratedRef.current = true;
+    }
+  }
+
+  useEffect(() => {
+    loadFromDb();
+
+    const autoSyncTimer = setInterval(() => {
+      loadFromDb();
+    }, 10000);
+
+    return () => clearInterval(autoSyncTimer);
+  }, []);
+
+  useEffect(() => {
+    const cleanData = normalizeEduData(data);
+    saveData(cleanData);
+
+    if (!hydratedRef.current) return;
+
+    const json = JSON.stringify(cleanData);
+    if (json === lastSavedRef.current) return;
+
+    clearTimeout(saveTimerRef.current);
+
+    saveTimerRef.current = setTimeout(() => {
+      saveToDb(cleanData);
+    }, 800);
+
+    return () => clearTimeout(saveTimerRef.current);
+  }, [data]);
+
+  return [data, setData, dbStatus, saveToDb, loadFromDb];
+}
+function TopBar({ title, subtitle, apiStatus }) {
+  return (
+    <div className="topbar">
+      <div>
+        <div className="kicker">
+          <Sparkles size={15} />
+          EduBrain SMAN 9
+        </div>
+        <h2>{title}</h2>
+        <p>{subtitle}</p>
+      </div>
+
+      <div className="statusPill">
+        <span className={cx("dot", apiStatus?.ready ? "on" : "warn")} />
+        {apiStatus?.ready ? "AI aktif & Memantau" : "Mode lokal"}
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ view, setView }) {
+  return (
+    <aside className="sidebar">
+      <div className="brand">
+        <div className="logo">
+          <Brain size={24} />
+        </div>
+        <div>
+          <h1>EduBrain</h1>
+          <p>SMAN 9 Depok</p>
+        </div>
+      </div>
+
+      <div className="nav">
+        {navItems.map((item) => {
+          const Icon = item.icon;
+          return (
+            <button
+              key={item.id}
+              onClick={() => setView(item.id)}
+              className={cx("navBtn", view === item.id && "active")}
+            >
+              <Icon size={19} />
+              {item.label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="sidebarFoot">
+        <div className="userMini">
+          <div className="avatar">SN</div>
+          <div>
+            <b>Guru SMAN 9</b>
+            <div className="itemSub">Asisten kerja sekolah</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function BottomNav({ view, setView }) {
+  return (
+    <div className="bottomNav">
+      {navItems.map((item) => {
+        const Icon = item.icon;
+        return (
+          <button key={item.id} onClick={() => setView(item.id)} className={view === item.id ? "active" : ""}>
+            <Icon size={20} />
+            <span>{item.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function EmptyState({ icon: Icon, title, text }) {
+  return (
+    <div className="empty">
+      <div className="emptyIcon">
+        <Icon size={26} />
+      </div>
+      <b>{title}</b>
+      <p>{text}</p>
+    </div>
+  );
+}
+
+
+function MediaPreview({ item, compact = false }) {
+  const src = item?.mediaUrl || item?.image || "";
+  const mediaType = item?.mediaType || "image";
+
+  if (!src) {
+    return <div className="mediaEmpty">Tidak ada media</div>;
+  }
+
+  if (mediaType === "video") {
+    return (
+      <video
+        className={compact ? "mediaPreview compact" : "mediaPreview"}
+        src={src}
+        controls
+        playsInline
+        preload="metadata"
+      />
+    );
+  }
+
+  if (mediaType === "audio") {
+    return (
+      <div className={compact ? "audioPreview compact" : "audioPreview"}>
+        <div className="audioIcon">Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¾Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Âª</div>
+        <audio src={src} controls preload="metadata" />
+      </div>
+    );
+  }
+
+  return (
+    <img
+      className={compact ? "mediaPreview compact" : "mediaPreview"}
+      src={src}
+      alt={item?.title || "Media aktivitas"}
+    />
+  );
+}
+
+
+
+function LoginView({ onLogin }) {
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function login() {
+    if (!password.trim()) {
+      setError("Password belum diisi.");
+      return;
+    }
+
+    setBusy(true);
+    setError("");
+
+    try {
+      const r = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+
+      const result = await r.json();
+
+      if (!result.ok) {
+        throw new Error(result.error || "Login gagal.");
+      }
+
+      const auth = {
+        role: result.role || "admin",
+        token: result.token,
+        loginAt: new Date().toISOString(),
+      };
+
+      localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
+      onLogin(auth);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="loginShell">
+      <div className="loginCard">
+        <div className="loginLogo">
+          <Brain size={34} />
+        </div>
+
+        <div className="kicker">
+          <ShieldCheck size={15} />
+          EduBrain SMAN 9
+        </div>
+
+        <h1>Login Admin</h1>
+        <p>
+          Masuk untuk mengelola notulen, galeri aktivitas, dokumen, dan sinkronisasi database.
+        </p>
+
+        <div className="formRow">
+          <label className="label">Password admin</label>
+          <input
+            className="input"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && login()}
+            placeholder="Masukkan password admin"
+            autoFocus
+          />
+        </div>
+
+        {error && <div className="loginError">{error}</div>}
+
+        <button className="btn primary full" onClick={login} disabled={busy}>
+          <ShieldCheck size={18} />
+          {busy ? "Memeriksa..." : "Masuk Admin"}
+        </button>
+
+        <div className="loginNote">
+          Password disimpan di file <b>.env.local</b> pada server lokal.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HomeView({ data, setView, apiStatus, dbStatus, loadFromDb, saveToDb }) {
+  const stats = [
+    {
+      label: "Notulen rapat terbaru",
+      value: data.meetings.length,
+      icon: Mic,
+    },
+    {
+      label: "Dokumen aktivitas",
+      value: data.documents.length,
+      icon: FileText,
+    },
+    {
+      label: "Chat AI",
+      value: data.chats.length,
+      icon: MessageCircle,
+    },
+  ];
+
+  const fallbackGallery = [
+    {
+      title: "Presentasi Siswa",
+      meta: "XI-A Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- 15/07/2026",
+      image: "/gallery/activity-1.svg",
+    },
+    {
+      title: "Diskusi Perpustakaan",
+      meta: "XI-A Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- 15/07/2026",
+      image: "/gallery/activity-2.svg",
+    },
+    {
+      title: "Praktikum Laboratorium",
+      meta: "XI-A Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- 15/07/2026",
+      image: "/gallery/activity-3.svg",
+    },
+    {
+      title: "Pentas Seni Sekolah",
+      meta: "XI-A Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- 17/07/2026",
+      image: "/gallery/activity-4.svg",
+    },
+    {
+      title: "Rapat Kelas",
+      meta: "XI-A Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- 18/07/2026",
+      image: "/gallery/activity-5.svg",
+    },
+    {
+      title: "Kegiatan Literasi",
+      meta: "XI-A Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- 19/07/2026",
+      image: "/gallery/activity-6.svg",
+    },
+  ];
+
+  const gallery = Array.isArray(data.activities) && data.activities.length > 0
+    ? data.activities.slice(0, 8)
+    : fallbackGallery;
+
+  return (
+    <>
+      <TopBar
+        title="Selamat bekerja, Bapak/Ibu Guru"
+        subtitle="Ruang kerja AI untuk kolaborasi dan dokumentasi aktivitas sekolah."
+        apiStatus={apiStatus}
+      />
+
+      <div className="homeSyncStrip">
+        <div>
+          <b>Database Supabase</b>
+          <span>{dbStatus?.message || "Auto sync aktif setiap 10 detik."}</span>
+        </div>
+        <div className="homeSyncActions">
+          <button className="miniSyncBtn" onClick={loadFromDb}>Muat DB</button>
+          <button className="miniSyncBtn dark" onClick={() => saveToDb(data, "Data dikirim manual dari Home")}>Simpan DB</button>
+        </div>
+      </div>
+
+      <div className="homeStudioGrid">
+        <section className="homeLeftPanel">
+          <div className="homeHeroCard">
+            <div className="heroBadge">
+              <ShieldCheck size={14} />
+              Groq API siap di server lokal
+            </div>
+
+            <h3>Rekam rapat, ubah jadi transkrip, lalu AI membuat notulen.</h3>
+
+            <p>
+              EduBrain membantu membuat ringkasan rapat, poin penting, keputusan,
+              tugas tindak lanjut, PIC, dan deadline.
+            </p>
+
+            <div className="heroActions">
+              <button className="btn light" onClick={() => setView("meetings")}>
+                <Mic size={18} /> Mulai Notulen
+              </button>
+              <button className="btn dark" onClick={() => setView("brain")}>
+                <Wand2 size={18} /> Tanya AI
+              </button>
+            </div>
+          </div>
+
+          <div className="homeStatsGrid">
+            {stats.map((s) => {
+              const Icon = s.icon;
+              return (
+                <div className="homeStatCard" key={s.label}>
+                  <div>
+                    <b>{s.value}</b>
+                    <span>{s.label}</span>
+                  </div>
+                  <div className="homeStatIcon">
+                    <Icon size={22} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="galleryPanel">
+          <div className="galleryHeader">
+            <div>
+              <h3>Galeri Aktivitas Siswa Terkini</h3>
+              <p>Dokumentasi kegiatan kelas dan sekolah.</p>
+            </div>
+            <div className="galleryLiveDot">
+              <span />
+              Live
+            </div>
+          </div>
+
+          <div className="galleryGrid">
+            {gallery.map((item) => (
+              <article className={"activityCard " + (item.mediaType || "image")} key={item.id || item.title}>
+                <MediaPreview item={item} />
+                <div className="activityOverlay">
+                  <span>{cleanActivityMeta(item.meta)}</span>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      </div>
+    </>
+  );
+}
+
+
+function ActivitiesView({ data, setData, apiStatus }) {
+  const [title, setTitle] = useState("");
+  const [className, setClassName] = useState("XI-A");
+  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [media, setMedia] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleMedia(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const allowed =
+      file.type.startsWith("image/") ||
+      file.type.startsWith("video/") ||
+      file.type.startsWith("audio/");
+
+    if (!allowed) {
+      alert("File harus berupa foto, video, atau rekaman audio.");
+      e.target.value = "";
+      return;
+    }
+
+    setBusy(true);
+
+    try {
+      const form = new FormData();
+      form.append("file", file);
+
+      const r = await fetch("/api/media/upload", {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      });
+
+      const result = await r.json();
+
+      if (!result.ok) {
+        throw new Error(result.detail || result.error || "Upload gagal.");
+      }
+
+      setMedia({
+        mediaUrl: result.url,
+        mediaPath: result.path,
+        mediaType: result.mediaType,
+        mimeType: result.mimeType,
+        size: result.size,
+        originalName: result.name,
+      });
+    } catch (error) {
+      alert("Gagal upload media: " + error.message);
+    } finally {
+      setBusy(false);
+      e.target.value = "";
+    }
+  }
+
+  function saveActivity() {
+    if (!title.trim()) {
+      alert("Judul kegiatan belum diisi.");
+      return;
+    }
+
+    if (!media?.mediaUrl) {
+      alert("Media kegiatan belum dipilih.");
+      return;
+    }
+
+    const item = {
+      id: uid(),
+      title: title.trim(),
+      meta: `${className || "Kelas"} Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- ${new Date(date).toLocaleDateString("id-ID")}`,
+      mediaUrl: media.mediaUrl,
+      mediaPath: media.mediaPath,
+      mediaType: media.mediaType,
+      mimeType: media.mimeType,
+      size: media.size,
+      originalName: media.originalName,
+      createdAt: new Date().toISOString(),
+    };
+
+    setData((prev) => ({
+      ...prev,
+      activities: [item, ...(prev.activities || [])],
+    }));
+
+    setTitle("");
+    setClassName("XI-A");
+    setDate(new Date().toISOString().slice(0, 10));
+    setMedia(null);
+  }
+
+  async function deleteActivity(item) {
+    if (!confirm("Hapus aktivitas ini dari galeri?")) return;
+
+    setData((prev) => ({
+      ...prev,
+      activities: (prev.activities || []).filter((x) => x.id !== item.id),
+    }));
+
+    if (item.mediaPath) {
+      fetch("/api/media/delete", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ path: item.mediaPath }),
+      }).catch(() => {});
+    }
+  }
+
+  const mediaLabel =
+    media?.mediaType === "video" ? "Video kegiatan siap disimpan" :
+    media?.mediaType === "audio" ? "Rekaman audio siap disimpan" :
+    media?.mediaType === "image" ? "Foto kegiatan siap disimpan" :
+    "Belum ada media";
+
+  return (
+    <>
+      <TopBar
+        title="Galeri Aktivitas"
+        subtitle="Tambahkan dokumentasi foto, video, atau rekaman kegiatan sekolah."
+        apiStatus={apiStatus}
+      />
+
+      <div className="grid2">
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Tambah Aktivitas Multimedia</h3>
+              <p>Foto, video presentasi siswa, rekaman kegiatan, atau video mengajar guru.</p>
+            </div>
+          </div>
+
+          <div className="formRow">
+            <label className="label">Judul kegiatan</label>
+            <input
+              className="input"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Contoh: Presentasi Kelompok PAI"
+            />
+          </div>
+
+          <div className="grid2 compactGrid">
+            <div className="formRow">
+              <label className="label">Kelas</label>
+              <input
+                className="input"
+                value={className}
+                onChange={(e) => setClassName(e.target.value)}
+                placeholder="XI-A"
+              />
+            </div>
+
+            <div className="formRow">
+              <label className="label">Tanggal</label>
+              <input
+                className="input"
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <label className="btn ghost full">
+            <Upload size={18} />
+            {busy ? "Mengupload media..." : "Pilih Foto / Video / Rekaman"}
+            <input type="file" accept="image/*,video/*,audio/*" hidden onChange={handleMedia} />
+          </label>
+
+          <div className="mediaHint">
+            Untuk tahap awal, usahakan video maksimal sekitar 100 MB agar upload stabil di jaringan sekolah.
+          </div>
+
+          {media && (
+            <div className="activityPreview">
+              <MediaPreview item={media} />
+              <div className="itemSub" style={{ padding: "10px 12px" }}>
+                {mediaLabel} Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- {media.originalName}
+              </div>
+            </div>
+          )}
+
+          <div style={{ height: 12 }} />
+
+          <button className="btn primary full" onClick={saveActivity} disabled={busy}>
+            <Plus size={18} />
+            Simpan ke Galeri
+          </button>
+        </div>
+
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Daftar Aktivitas</h3>
+              <p>{(data.activities || []).length} aktivitas tersimpan.</p>
+            </div>
+          </div>
+
+          {!data.activities || data.activities.length === 0 ? (
+            <EmptyState
+              icon={Upload}
+              title="Belum ada aktivitas"
+              text="Tambahkan foto, video, atau rekaman kegiatan pertama."
+            />
+          ) : (
+            <div className="activityManageList">
+              {data.activities.map((item) => (
+                <div className="activityManageItem media" key={item.id}>
+                  <div className="manageMediaBox">
+                    <MediaPreview item={item} compact />
+                  </div>
+                  <div>
+                    <b>{item.title}</b>
+                    <span>{cleanActivityMeta(item.meta)}</span>
+                    <span>{item.mediaType || "image"} Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- {item.originalName || "media"}</span>
+                  </div>
+                  <button className="btn ghost dangerBtn" onClick={() => deleteActivity(item)}>
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+
+function EvidenceAudioRecorder({ data, setData }) {
+  const [saveEvidence, setSaveEvidence] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [message, setMessage] = useState("Mode hemat aktif: rekaman audio tidak disimpan.");
+  const [lastUrl, setLastUrl] = useState("");
+
+  const recorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const timerRef = useRef(null);
+
+  function formatTime(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+
+    if (h > 0) {
+      return h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+    }
+
+    return m + ":" + String(s).padStart(2, "0");
+  }
+
+  async function startEvidenceRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      alert("Browser ini belum mendukung perekam audio. Coba pakai Chrome laptop atau Chrome Android.");
+      return;
+    }
+
+    try {
+      setMessage(saveEvidence ? "Merekam bukti audio. Audio akan disimpan setelah dihentikan." : "Merekam sementara. Audio akan dibuang setelah dihentikan.");
+      setLastUrl("");
+      setDuration(0);
+      chunksRef.current = [];
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      let options = {};
+      if (MediaRecorder.isTypeSupported("audio/webm")) {
+        options = { mimeType: "audio/webm" };
+      }
+
+      const recorder = new MediaRecorder(stream, options);
+      recorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        chunksRef.current = [];
+
+        if (!saveEvidence) {
+          setMessage("Rekaman selesai dan tidak disimpan. Yang disimpan cukup notulen/transkrip.");
+          setLastUrl("");
+          return;
+        }
+
+        await uploadEvidenceAudio(blob);
+      };
+
+      recorder.start(1000);
+      setRecording(true);
+
+      timerRef.current = setInterval(() => {
+        setDuration((v) => v + 1);
+      }, 1000);
+    } catch (error) {
+      alert("Gagal membuka mikrofon: " + error.message);
+      setMessage("Mikrofon belum bisa dibuka.");
+    }
+  }
+
+  function stopEvidenceRecording() {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+
+    const recorder = recorderRef.current;
+
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+
+    setRecording(false);
+  }
+
+  async function uploadEvidenceAudio(blob) {
+    setBusy(true);
+    setMessage("Mengupload rekaman bukti ke penyimpanan...");
+
+    try {
+      const fileName = "rekaman-rapat-" + new Date().toISOString().replace(/[:.]/g, "-") + ".webm";
+      const file = new File([blob], fileName, { type: "audio/webm" });
+
+      const form = new FormData();
+      form.append("file", file);
+
+      const r = await fetch("/api/media/upload", {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      });
+
+      const result = await r.json();
+
+      if (!result.ok) {
+        throw new Error(result.detail || result.error || "Upload rekaman gagal.");
+      }
+
+      const item = {
+        id: uid(),
+        title: "Rekaman Bukti Rapat",
+        meta: "Rapat - " + new Date().toLocaleDateString("id-ID"),
+        mediaUrl: result.url,
+        mediaPath: result.path,
+        mediaType: "audio",
+        mimeType: result.mimeType,
+        size: result.size,
+        originalName: result.name,
+        createdAt: new Date().toISOString(),
+        source: "meeting-evidence",
+      };
+
+      setData((prev) => ({
+        ...prev,
+        activities: [item, ...(prev.activities || [])],
+      }));
+
+      setLastUrl(result.url);
+      setMessage("Rekaman bukti berhasil disimpan ke Galeri Aktivitas.");
+    } catch (error) {
+      setMessage("Gagal menyimpan rekaman bukti: " + error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card evidenceCard">
+      <div className="sectionHead">
+        <div>
+          <h3>Perekam Bukti Audio Rapat</h3>
+          <p>Default hemat: simpan notulen saja. Centang jika rapat penting dan audio perlu disimpan.</p>
+        </div>
+      </div>
+
+      <label className="evidenceCheck">
+        <input
+          type="checkbox"
+          checked={saveEvidence}
+          onChange={(e) => setSaveEvidence(e.target.checked)}
+          disabled={recording || busy}
+        />
+        <span>
+          <b>Simpan rekaman audio sebagai bukti</b>
+          <small>Gunakan hanya untuk rapat penting, pembinaan penting, atau kegiatan yang perlu arsip suara.</small>
+        </span>
+      </label>
+
+      <div className="evidenceStatus">
+        <div>
+          <b>{recording ? "Sedang merekam" : "Tidak merekam"}</b>
+          <span>Durasi: {formatTime(duration)}</span>
+        </div>
+        <div className={saveEvidence ? "evidenceBadge save" : "evidenceBadge"}>
+          {saveEvidence ? "BUKTI DISIMPAN" : "HEMAT STORAGE"}
+        </div>
+      </div>
+
+      <div className="evidenceActions">
+        {!recording ? (
+          <button className="btn primary" onClick={startEvidenceRecording} disabled={busy}>
+            <Mic size={18} />
+            Mulai Rekam Audio
+          </button>
+        ) : (
+          <button className="btn danger" onClick={stopEvidenceRecording}>
+            <Square size={18} />
+            Stop Rekaman
+          </button>
+        )}
+      </div>
+
+      <div className="mediaHint">{message}</div>
+
+      {lastUrl && (
+        <div className="evidencePlayer">
+          <audio src={lastUrl} controls />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function MeetingsView({ data, setData, apiStatus }) {
+  const [title, setTitle] = useState("");
+  const [agenda, setAgenda] = useState("");
+  const [transcript, setTranscript] = useState("");
+  const [liveText, setLiveText] = useState("");
+  const [minutes, setMinutes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
+  const [selectedId, setSelectedId] = useState(null);
+
+  const recognitionRef = useRef(null);
+  const recordingRef = useRef(false);
+
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      setSpeechSupported(false);
+      return;
+    }
+
+    setSpeechSupported(true);
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = "id-ID";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = (event) => {
+      let finalText = "";
+      let interimText = "";
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const part = event.results[i][0]?.transcript || "";
+        if (event.results[i].isFinal) {
+          finalText += part + " ";
+        } else {
+          interimText += part + " ";
+        }
+      }
+
+      if (finalText.trim()) {
+        setTranscript((prev) => {
+          const clean = finalText.trim();
+          return prev ? `${prev}\n${clean}` : clean;
+        });
+      }
+
+      setLiveText(interimText.trim());
+    };
+
+    recognition.onerror = (event) => {
+      console.warn("Speech recognition error:", event.error);
+    };
+
+    recognition.onend = () => {
+      if (recordingRef.current) {
+        try {
+          recognition.start();
+        } catch {
+          // browser sedang sibuk, abaikan
+        }
+      }
+    };
+
+    recognitionRef.current = recognition;
+
+    return () => {
+      recordingRef.current = false;
+      try {
+        recognition.stop();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+
+  function startRecording() {
+    if (!speechSupported || !recognitionRef.current) {
+      alert("Browser belum mendukung transkripsi suara. Gunakan Chrome/Edge terbaru, atau ketik/paste transkrip manual.");
+      return;
+    }
+
+    if (!title.trim()) {
+      setTitle("Rapat " + new Date().toLocaleDateString("id-ID"));
+    }
+
+    recordingRef.current = true;
+    setIsRecording(true);
+
+    try {
+      recognitionRef.current.start();
+    } catch {
+      // jika sudah berjalan
+    }
+  }
+
+  function stopRecording() {
+    recordingRef.current = false;
+    setIsRecording(false);
+    setLiveText("");
+
+    try {
+      recognitionRef.current?.stop();
+    } catch {
+      // ignore
+    }
+  }
+
+  function clearDraft() {
+    if (!confirm("Kosongkan draft rapat saat ini?")) return;
+    setTitle("");
+    setAgenda("");
+    setTranscript("");
+    setLiveText("");
+    setMinutes("");
+  }
+
+  async function createMinutes() {
+    if (!transcript.trim()) {
+      alert("Transkrip masih kosong. Rekam dulu atau ketik/paste isi rapat.");
+      return;
+    }
+
+    setBusy(true);
+    setMinutes("");
+
+    const prompt = `
+Buatkan NOTULEN RAPAT resmi dalam bahasa Indonesia berdasarkan transkrip berikut.
+
+Gunakan format rapi:
+
+1. Judul Rapat
+2. Waktu Rapat
+3. Agenda
+4. Ringkasan Singkat
+5. Poin-Poin Penting
+6. Keputusan Rapat
+7. Daftar Tugas Tindak Lanjut
+   - Tugas
+   - Penanggung jawab/PIC jika disebutkan
+   - Deadline jika disebutkan
+   - Prioritas
+8. Risiko/Catatan Khusus
+9. Rekomendasi untuk tindak lanjut sekolah
+
+Data rapat:
+Judul: ${title || "-"}
+Agenda: ${agenda || "-"}
+
+Transkrip:
+${transcript}
+`;
+
+    try {
+      const r = await fetch("/api/ai/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: prompt, context: "Fitur Notulen Rapat EduBrain SMAN 9" }),
+      });
+
+      const result = await r.json();
+      const text = result.text || result.error || "AI tidak mengembalikan notulen.";
+      setMinutes(text);
+
+      const meeting = {
+        id: uid(),
+        title: title.trim() || "Rapat tanpa judul",
+        agenda: agenda.trim(),
+        transcript: transcript.trim(),
+        minutes: text,
+        date: new Date().toLocaleString("id-ID"),
+      };
+
+      setData((prev) => ({
+        ...prev,
+        meetings: [meeting, ...prev.meetings],
+      }));
+
+      setSelectedId(meeting.id);
+    } catch (error) {
+      setMinutes("Gagal membuat notulen: " + error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function deleteMeeting(id) {
+    if (!confirm("Hapus notulen rapat ini?")) return;
+    setData((prev) => ({
+      ...prev,
+      meetings: prev.meetings.filter((m) => m.id !== id),
+    }));
+    if (selectedId === id) setSelectedId(null);
+  }
+
+  function downloadText(meeting) {
+    const content = `
+NOTULEN RAPAT
+${meeting.title}
+
+Tanggal:
+${meeting.date}
+
+Agenda:
+${meeting.agenda || "-"}
+
+NOTULEN AI:
+${meeting.minutes || "-"}
+
+TRANSKRIP:
+${meeting.transcript || "-"}
+`.trim();
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${meeting.title.replace(/[\\/:*?"<>|]/g, "-")}-notulen.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const selected = data.meetings.find((m) => m.id === selectedId) || data.meetings[0];
+
+  return (
+    <>
+      <TopBar
+        title="Notulen Rapat AI"
+        subtitle="Rekam rapat, dapatkan transkrip, lalu Groq membuat notulen otomatis."
+        apiStatus={apiStatus}
+      />\n\n      <EvidenceAudioRecorder data={data} setData={setData} />
+
+      <div className="grid2">
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Rekam Rapat</h3>
+              <p>Gunakan Chrome/Edge. Bahasa transkripsi: Indonesia.</p>
+            </div>
+            <div className={cx("recordBadge", isRecording && "on")}>
+              {isRecording ? "Merekam" : "Siap"}
+            </div>
+          </div>
+
+          {!speechSupported && (
+            <div className="installHint" style={{ marginBottom: 14 }}>
+              Browser ini belum mendukung transkripsi suara langsung. Gunakan Chrome/Edge terbaru,
+              atau ketik/paste hasil rapat di kolom transkrip.
+            </div>
+          )}
+
+          <div className="formRow">
+            <label className="label">Judul rapat</label>
+            <input
+              className="input"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Contoh: Rapat Wali Kelas XI"
+            />
+          </div>
+
+          <div className="formRow">
+            <label className="label">Agenda rapat</label>
+            <input
+              className="input"
+              value={agenda}
+              onChange={(e) => setAgenda(e.target.value)}
+              placeholder="Contoh: Evaluasi absensi dan tindak lanjut BK"
+            />
+          </div>
+
+          <div className="recorderPanel">
+            {!isRecording ? (
+              <button className="recordButton" onClick={startRecording}>
+                <PlayCircle size={26} />
+                Mulai Rekam
+              </button>
+            ) : (
+              <button className="recordButton on" onClick={stopRecording}>
+                <PauseCircle size={26} />
+                Stop Rekam
+              </button>
+            )}
+          </div>
+
+          <div className="formRow">
+            <label className="label">Transkrip rapat</label>
+            <textarea
+              className="textarea transcriptArea"
+              value={transcript + (liveText ? `\n\n${liveText}` : "")}
+              onChange={(e) => {
+                setTranscript(e.target.value);
+                setLiveText("");
+              }}
+              placeholder="Transkrip akan muncul saat rapat direkam. Bisa juga diketik/paste manual."
+            />
+          </div>
+
+          <div className="heroActions">
+            <button className="btn primary" onClick={createMinutes} disabled={busy || !transcript.trim()}>
+              <Brain size={18} />
+              {busy ? "AI membuat notulen..." : "Buat Notulen AI"}
+            </button>
+            <button className="btn ghost" onClick={clearDraft}>
+              <Trash2 size={18} />
+              Kosongkan Draft
+            </button>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Hasil Notulen</h3>
+              <p>Notulen otomatis akan tersimpan setelah dibuat.</p>
+            </div>
+          </div>
+
+          {minutes ? (
+            <div className="minutesBox">{minutes}</div>
+          ) : (
+            <EmptyState
+              icon={ClipboardCheck}
+              title="Belum ada notulen"
+              text="Rekam rapat atau paste transkrip, lalu klik Buat Notulen AI."
+            />
+          )}
+        </div>
+      </div>
+
+      <div style={{ height: 16 }} />
+
+      <div className="grid2">
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Arsip Notulen</h3>
+              <p>{data.meetings.length} notulen tersimpan</p>
+            </div>
+          </div>
+
+          {data.meetings.length === 0 ? (
+            <EmptyState icon={Mic} title="Belum ada arsip" text="Notulen yang dibuat AI akan muncul di sini." />
+          ) : (
+            <div className="list">
+              {data.meetings.map((m) => (
+                <button
+                  key={m.id}
+                  className={cx("meetingCard", selected?.id === m.id && "active")}
+                  onClick={() => setSelectedId(m.id)}
+                >
+                  <div className="itemIcon"><FileText size={18} /></div>
+                  <div>
+                    <div className="itemTitle">{m.title}</div>
+                    <div className="itemSub">{m.date}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Detail Arsip</h3>
+              <p>Download atau hapus notulen.</p>
+            </div>
+          </div>
+
+          {!selected ? (
+            <EmptyState icon={FileText} title="Pilih arsip" text="Klik salah satu notulen di daftar arsip." />
+          ) : (
+            <div>
+              <div className="item" style={{ alignItems: "flex-start" }}>
+                <div className="itemIcon"><FileText size={18} /></div>
+                <div>
+                  <div className="itemTitle">{selected.title}</div>
+                  <div className="itemSub">{selected.date}</div>
+                  <div className="itemSub">Agenda: {selected.agenda || "-"}</div>
+                </div>
+              </div>
+
+              <div style={{ height: 12 }} />
+
+              <div className="minutesBox small">{selected.minutes}</div>
+
+              <div style={{ height: 12 }} />
+
+              <div className="heroActions">
+                <button className="btn primary" onClick={() => downloadText(selected)}>
+                  <Download size={18} />
+                  Download TXT
+                </button>
+                <button className="btn dark" onClick={() => deleteMeeting(selected.id)}>
+                  <Trash2 size={18} />
+                  Hapus
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function BrainView({ data, setData, apiStatus }) {
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [data.chats, busy]);
+
+  async function uploadDoc(e) {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    const docs = [];
+    for (const file of files) {
+      const content = await readTextFile(file);
+      docs.push({
+        id: uid(),
+        name: file.name,
+        size: `${Math.round(file.size / 1024)} KB`,
+        type: file.type || "file",
+        date: new Date().toLocaleString("id-ID"),
+        content,
+        readable: Boolean(content),
+      });
+    }
+
+    setData((prev) => ({ ...prev, documents: [...docs, ...prev.documents] }));
+    e.target.value = "";
+  }
+
+  async function send(customPrompt) {
+    const text = customPrompt || input.trim();
+    if (!text || busy) return;
+
+    const userMsg = { id: uid(), role: "user", text };
+    setData((prev) => ({ ...prev, chats: [...prev.chats, userMsg] }));
+    setInput("");
+    setBusy(true);
+
+    try {
+      const context = [
+        `Jumlah dokumen: ${data.documents.length}`,
+        `Daftar dokumen: ${data.documents.map((d) => d.name).join(", ") || "-"}`,
+        `Isi dokumen yang bisa dibaca:`,
+        ...data.documents
+          .filter((d) => d.content)
+          .slice(0, 5)
+          .map((d) => `--- ${d.name} ---\n${d.content}`),
+        `Jumlah notulen rapat: ${data.meetings.length}`,
+        `Notulen rapat:`,
+        ...data.meetings
+          .slice(0, 5)
+          .map((m) => `--- ${m.title} ---\n${m.minutes || m.transcript || "-"}`),
+      ].join("\n\n");
+
+      const r = await fetch("/api/ai/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, context }),
+      });
+
+      const result = await r.json();
+      const aiMsg = {
+        id: uid(),
+        role: "ai",
+        text: result.text || result.error || "Tidak ada jawaban.",
+      };
+
+      setData((prev) => ({ ...prev, chats: [...prev.chats, aiMsg] }));
+    } catch (error) {
+      setData((prev) => ({
+        ...prev,
+        chats: [...prev.chats, { id: uid(), role: "ai", text: "Gagal menghubungi AI: " + error.message }],
+      }));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const tools = [
+    ["Ringkas semua notulen rapat yang tersimpan dan buat daftar keputusan penting.", "Ringkas rapat"],
+    ["Buatkan daftar tugas tindak lanjut dari semua notulen rapat yang tersimpan.", "Buat tugas"],
+    ["Buatkan template surat panggilan orang tua yang sopan dan resmi untuk kasus kedisiplinan siswa.", "Draf surat"],
+    ["Buatkan format catatan pembinaan siswa/BK yang lengkap dan rapi.", "Catatan BK"],
+  ];
+
+  return (
+    <>
+      <TopBar
+        title="Otak Kedua AI"
+        subtitle="Tanya dokumen, notulen, surat, pembinaan, dan administrasi sekolah."
+        apiStatus={apiStatus}
+      />
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="sectionHead">
+          <div>
+            <h3>AI Tools Cepat</h3>
+            <p>Pilih kebutuhan sekolah.</p>
+          </div>
+        </div>
+        <div className="quickGrid">
+          {tools.map(([prompt, label]) => (
+            <button key={label} className="quickBtn" onClick={() => send(prompt)}>
+              <Wand2 size={18} /> {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid2">
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Document Vault</h3>
+              <p>Upload dokumen sekolah.</p>
+            </div>
+          </div>
+
+          <label className="btn primary full">
+            <Upload size={18} /> Upload dokumen
+            <input type="file" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md,.json" hidden onChange={uploadDoc} />
+          </label>
+
+          <div style={{ height: 14 }} />
+
+          {data.documents.length === 0 ? (
+            <EmptyState icon={FileText} title="Belum ada dokumen" text="Upload TXT/CSV/MD/JSON agar isi dokumen langsung terbaca." />
+          ) : (
+            <div className="list">
+              {data.documents.map((d) => (
+                <div className="item" key={d.id}>
+                  <div className="itemIcon"><FileText size={18} /></div>
+                  <div>
+                    <div className="itemTitle">{d.name}</div>
+                    <div className="itemSub">
+                      {d.size} Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã…Â¡Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¾Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¾Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã…Â¡Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¾Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- {d.date} Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã…Â¡Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¾Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¾Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã…Â¡Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¾Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Å¡Ã‚Â¦Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã‚Â¢Ã…Â¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Â Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã…Â¡Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ã¢â‚¬Å¾Ã‚Â¢Ã¢â‚¬â„¢Ã¢â‚¬Å¡Ã‚Â¢Ã‚Â¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡Ã¢â‚¬Å¡Ã‚Â¬Ã‚Â¦Ã¢â‚¬Å¡Ã‚Â¡Ã¢â‚¬â„¢Ã¢â‚¬Â Ã‚Â¢Ã‚Â¢Ã…Â¡Ã‚Â¬Ã¢â‚¬Â¦Ã‚Â¡Ã¢â‚¬â„¢Ã‚Â¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡- {d.readable ? "isi terbaca" : "metadata saja"}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="card chatBox">
+          <div className="sectionHead">
+            <div>
+              <h3>Chat AI</h3>
+              <p>{apiStatus?.ready ? "Terhubung ke Groq." : "Mode lokal."}</p>
+            </div>
+          </div>
+
+          <div className="messages" ref={scrollRef}>
+            {data.chats.length === 0 && (
+              <EmptyState icon={Brain} title="Mulai bertanya" text="Contoh: buatkan draf surat panggilan orang tua." />
+            )}
+
+            {data.chats.map((m) => (
+              <div className={`msg ${m.role}`} key={m.id}>{m.text}</div>
+            ))}
+
+            {busy && <div className="msg ai">EduBrain sedang berpikir...</div>}
+          </div>
+
+          <div className="chatInput">
+            <input
+              className="input"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && send()}
+              placeholder="Tulis pertanyaan untuk EduBrain..."
+            />
+            <button className="btn primary" onClick={() => send()} disabled={busy || !input.trim()}>
+              <Send size={18} />
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function InstallGuide() {
+  const [show, setShow] = useState(false);
+
+  return (
+    <div className="installAppBox">
+      <div>
+        <b>Pasang EduBrain di HP</b>
+        <span>Jadikan seperti aplikasi dengan ikon di layar utama Android.</span>
+      </div>
+      <button className="miniSyncBtn dark" onClick={() => setShow(!show)}>
+        Cara Pasang
+      </button>
+
+      {show && (
+        <div className="installSteps">
+          <p><b>Android Chrome:</b></p>
+          <p>1. Buka alamat EduBrain dari HP.</p>
+          <p>2. Tekan titik tiga di kanan atas Chrome.</p>
+          <p>3. Pilih <b>Tambahkan ke layar utama</b> / <b>Add to Home Screen</b>.</p>
+          <p>4. Pilih nama <b>EduBrain</b>, lalu tekan Tambahkan.</p>
+          <p>5. Ikon EduBrain akan muncul di layar HP.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+function SettingsView({ data, setData, apiStatus, refreshStatus, dbStatus, saveToDb, loadFromDb }) {
+  function resetAll() {
+    if (!confirm("Kosongkan semua data lokal EduBrain?")) return;
+    setData(initialData);
+  }
+
+  function exportData() {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "edubrain-sman9-data.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <>
+      <TopBar title="Pengaturan" subtitle="Status Groq, data lokal, dan kesiapan Android." apiStatus={apiStatus} />
+
+      <InstallGuide />
+
+      <div className="grid2">
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Status API</h3>
+              <p>API key tetap aman di file .env.local.</p>
+            </div>
+            {apiStatus?.ready ? <Wifi color="#22c55e" /> : <WifiOff color="#f59e0b" />}
+          </div>
+
+          <div className="list">
+            <div className="item">
+              <div className="itemIcon"><Brain size={18} /></div>
+              <div>
+                <div className="itemTitle">Provider: {apiStatus?.provider || "mock"}</div>
+                <div className="itemSub">Model: {apiStatus?.model || "mock-local"}</div>
+              </div>
+            </div>
+            <button className="btn primary full" onClick={refreshStatus}>
+              <Wifi size={18} /> Cek ulang status API
+            </button>
+
+            <button className="btn ghost full" onClick={loadFromDb}>
+              <Download size={18} /> Muat dari Database
+            </button>
+
+            <button className="btn dark full" onClick={() => saveToDb(data, "Data disimpan manual ke database")}>
+              <Upload size={18} /> Simpan ke Database
+            </button>
+
+            <div className="syncStatus">
+              <b>Status sinkron:</b>
+              <span>{dbStatus?.message || "Belum dicek"}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="sectionHead">
+            <div>
+              <h3>Data lokal</h3>
+              <p>Export atau kosongkan data.</p>
+            </div>
+          </div>
+
+          <div className="list">
+            <button className="btn ghost full" onClick={exportData}>
+              <Download size={18} /> Export data JSON
+            </button>
+            <button className="btn dark full" onClick={resetAll}>
+              <Trash2 size={18} /> Kosongkan data lokal
+            </button>
+          </div>
+
+          <div style={{ height: 14 }} />
+
+          <div className="installHint">
+            <b>Pasang ke HP Android</b>
+            <div className="itemSub" style={{ marginTop: 6 }}>
+              Untuk rekam suara di HP, nanti paling ideal memakai HTTPS/deploy. Di laptop gunakan localhost.
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+export default function App() {
+  const [view, setView] = useState("home");
+  const [auth, setAuth] = useState(() => {
+    try {
+      const raw = localStorage.getItem(AUTH_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [data, setData, dbStatus, saveToDb, loadFromDb] = useEduData();
+  const [apiStatus, setApiStatus] = useState(null);
+
+  async function refreshStatus() {
+    try {
+      const r = await fetch("/api/ai/status");
+      const result = await r.json();
+      setApiStatus(result);
+    } catch {
+      setApiStatus({ provider: "offline", model: "server-mati", ready: false });
+    }
+  }
+
+  useEffect(() => {
+    refreshStatus();
+  }, []);
+
+  function logout() {
+    localStorage.removeItem(AUTH_KEY);
+    setAuth(null);
+    setView("home");
+  }
+
+  if (!auth?.token) {
+    return <LoginView onLogin={setAuth} />;
+  }
+
+  const page = useMemo(() => {
+    if (view === "meetings") return <MeetingsView data={data} setData={setData} apiStatus={apiStatus} />;
+    if (view === "activities") return <ActivitiesView data={data} setData={setData} apiStatus={apiStatus} />;
+    if (view === "brain") return <BrainView data={data} setData={setData} apiStatus={apiStatus} />;
+    if (view === "settings") return <SettingsView data={data} setData={setData} apiStatus={apiStatus} refreshStatus={refreshStatus} dbStatus={dbStatus} saveToDb={saveToDb} loadFromDb={loadFromDb} />;
+    return <HomeView data={data} setView={setView} apiStatus={apiStatus} dbStatus={dbStatus} loadFromDb={loadFromDb} saveToDb={saveToDb} />;
+  }, [view, data, apiStatus]);
+
+  return (
+    <div className="appShell">
+      <Sidebar view={view} setView={setView} />
+      <main className="main">
+        <div className="adminTopMini">
+          <span>Mode Admin Aktif</span>
+          <button onClick={logout}>Keluar</button>
+        </div>
+        {page}
+      </main>
+      <BottomNav view={view} setView={setView} />
+    </div>
+  );
+}
+
+
+
+
+
+
+

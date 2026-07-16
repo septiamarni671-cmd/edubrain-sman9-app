@@ -1,0 +1,20 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="55%" stop-color="#14b8a6"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#0f172a" flood-opacity=".28"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="118" fill="url(#g)"/>
+  <circle cx="390" cy="116" r="90" fill="white" opacity=".12"/>
+  <circle cx="120" cy="410" r="120" fill="white" opacity=".10"/>
+  <g filter="url(#s)">
+    <rect x="96" y="110" width="320" height="292" rx="72" fill="white" opacity=".18"/>
+    <path d="M192 183c-38 0-69 30-69 68 0 27 16 51 39 62v37c0 10 8 18 18 18h22c10 0 18-8 18-18V201c0-10-8-18-18-18h-10zm128 0h-10c-10 0-18 8-18 18v149c0 10 8 18 18 18h22c10 0 18-8 18-18v-37c23-11 39-35 39-62 0-38-31-68-69-68zm-64-28c-17 0-31 14-31 31v180c0 17 14 31 31 31s31-14 31-31V186c0-17-14-31-31-31z" fill="white"/>
+  </g>
+  <text x="256" y="454" text-anchor="middle" font-family="Arial, sans-serif" font-size="42" font-weight="900" fill="white">EB</text>
+</svg>
